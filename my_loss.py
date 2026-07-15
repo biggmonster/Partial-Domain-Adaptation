@@ -17,6 +17,40 @@ def grl_hook(coeff):           # 梯度反转层的钩子函数（GRL）， coe 
         return -coeff*grad.clone()
     return fun1
 
+def MLP_Reg_Loss(MLPS, f_dims, e_dims, l1_weight=0.5):
+    '''
+    用 MLP_Reg_Loss 计算每个语义维度e_dims 对 feature 的梯度敏感性: f_dim[j].grad
+    '''
+    mlp_losses = 0.0
+    for j in range(len(MLPS)):
+        l1_penalty = l1_weight * sum([p.abs().sum() for p in MLPS[j].hidden_1.parameters()])
+        prediction = MLPS[j](f_dims[j])
+        mlp_loss = F.mse_loss(prediction.view(-1), e_dims[j]) + l1_penalty
+        mlp_losses += mlp_loss
+
+    return mlp_losses / len(MLPS)
+
+def Semantic_Alignment_Loss(features, f_dims, source_size, target_size):
+    '''
+    用f_dim中已有的特征梯度敏感性作为 mask, 去计算 source/target 的语义对齐
+    '''
+    align_losses = 0.0
+    for j in range(len(f_dims)):
+        absolute_grad = torch.abs(f_dims[j].grad.data)
+        absolute_grad = absolute_grad.div(absolute_grad.norm(p=2, keepdim=True)/(source_size + target_size))
+        att_features = torch.mul(features, absolute_grad)
+
+        att_s = att_features[:source_size]
+        att_t = att_features[source_size:]
+
+        source_mean = torch.mean(att_s, 0)
+        target_mean = torch.mean(att_t, 0)
+
+        align_loss = F.mse_loss(source_mean, target_mean)
+        align_losses += align_loss
+
+    return align_losses
+
 def DANN_Loss(features, ad_net, entropy=None, coeff=None, cls_weight=None):        # 对抗性领域适应的损失函数
     '''
     双加权
@@ -48,9 +82,3 @@ def DANN_Loss(features, ad_net, entropy=None, coeff=None, cls_weight=None):     
     
     weight = weight.view(-1, 1)
     return torch.sum(weight * nn.BCELoss(reduction='none')(ad_out, dc_target)) / (1e-8 + torch.sum(weight).detach().item())     # 计算加权的二元交叉熵损失
-
-
-
-
-
-

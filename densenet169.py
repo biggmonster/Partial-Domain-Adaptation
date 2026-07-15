@@ -100,7 +100,7 @@ densenet_dict = {
 
 
 class DenseNet169(nn.Module):
-    def __init__(self, dn_name, class_num=1000, bottleneck_dim= 512, embedding_dim=256 ):
+    def __init__(self, dn_name,  bottleneck_dim= 512, embedding_dim=256 ):
 
         super(DenseNet169, self).__init__()
         model_densenet =densenet_dict[dn_name](weights=densenet_weights_dict[dn_name])
@@ -126,10 +126,8 @@ class DenseNet169(nn.Module):
             )
         
         # Linear layer
-        self.classifier = nn.Linear(bottleneck_dim, class_num)
 
         self.bottleneck.apply(init_weights)              
-        self.classifier.apply(init_weights)
         self.__in_features = bottleneck_dim 
 
         # Initialization
@@ -153,8 +151,8 @@ class DenseNet169(nn.Module):
         x = self.bottleneck(x)
         e = self.encoder(x)   # 编码输出，维度（ batch_size, embedding_dim ）  e- encoder
         r = self.decoder(e)   # 解码输出，维度（ batch_size, bottleneck_dim ） r- recover
-        y = self.classifier(x)
-        return x, y, e, r
+        
+        return x, e, r
     
     def get_parameters(self):
         parameter_list = [
@@ -162,7 +160,7 @@ class DenseNet169(nn.Module):
                         {"params":self.bottleneck.parameters(), "lr_mult":10, 'decay_mult':2}, \
                         {"params":self.encoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
                         {"params":self.decoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
-                        {"params":self.classifier.parameters(), "lr_mult":10, 'decay_mult':2}]
+                        ]
         
         return parameter_list 
     

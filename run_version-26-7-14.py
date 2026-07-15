@@ -14,6 +14,8 @@ from tqdm import tqdm
 import torch.utils.checkpoint as checkpoint
 from torch.utils.data import Subset
 import densenet169
+import copy
+from datetime import datetime
 
 # 原代码，可用于ads-b信号      
 def image_train(resize_size=256, crop_size=224):   # resize_size指定图像在裁剪前的尺寸，crop_size随机裁剪后图片的尺寸
@@ -35,7 +37,7 @@ def image_test(resize_size=256, crop_size=224):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-def image_test_classification(loader, model):
+def image_test_classification(loader, base_model, classifiers):
     start_test = True
     
     with torch.no_grad():  # 下述代码不进行梯度计算
@@ -51,7 +53,9 @@ def image_test_classification(loader, model):
             total_samples_iter += batch_size_flag
 
             inputs = inputs.cuda()  # 
-            _, outputs, _, _ = model(inputs) # 模型的输出，分类的结果 
+            out_f,  _, _ = base_model(inputs) # 模型输出特征
+            outputs = classifiers(out_f, mode='test')
+
             if start_test:
                 all_output = outputs.float().cpu()
                 all_label = labels.float()   #
@@ -71,6 +75,26 @@ def image_test_classification(loader, model):
                                                                 # 输出的维度：hist_tar--[类别数量] 
     hist_tar = hist_tar / hist_tar.sum()    # 每个类别占总类别的输出概率 （算是归一化了），用于表示一个类别在测试集中的比例
     return accuracy, hist_tar, mean_ent
+
+
+def get_Classifier_logits_probs(Classifiers, feat):
+    logits = Classifiers(feat)
+    probs = torch.nn.Softmax(dim=1)(logits)
+    return logits, probs
+
+def savemodel(best_model, args):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    snr = (args.t-1)*5
+    file_name = f"TD_{args.multi_class}class_SNR_{snr}_best_model_en_{timestamp}.pt"
+    save_dir = os.path.join('model',f'{args.net}')
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    model_path = os.path.join(save_dir, file_name)
+    try:
+        torch.save(best_model, model_path)
+        print(f"model is saved in: {model_path}")
+    except Exception as e:
+        print(f"model is not saved: {e}")
 
 
 def print_line():
@@ -119,16 +143,16 @@ def train(args):
     print()
 
     if "ResNet50" in args.net:
-        params = {"resnet_name":args.net, "use_bottleneck":True, "bottleneck_dim": args.fdim, "new_cls":True, 'class_num': args.class_num, "embedding_dim": args.edim}
+        params = {"resnet_name":args.net, "use_bottleneck":True, "bottleneck_dim": args.fdim, "new_cls":True, "embedding_dim": args.edim}
         # base_network = network.ResNetFc(**params)  
         base_network = en_network.ResNetFc(**params)   # **表示字典解包操作
 
     if "VGG16" in args.net:
-        params = {"vgg_name":args.net, "use_bottleneck":True, "bottleneck_dim":args.fdim, "new_cls":True, 'class_num': args.class_num, "embedding_dim": args.edim}
+        params = {"vgg_name":args.net, "use_bottleneck":True, "bottleneck_dim":args.fdim, "new_cls":True, "embedding_dim": args.edim}
         base_network = en_network.VGGFc(**params)
 
     if "RepVGG_B1g2" in args.net:
-        params = {"use_bottleneck":True, "bottleneck_dim":args.fdim, "new_cls":True, "class_num":args.class_num, "embedding_dim": args.edim}
+        params = {"use_bottleneck":True, "bottleneck_dim":args.fdim, "new_cls":True, "embedding_dim": args.edim}
         base_network = en_network.RepVGG_B1g2(**params)
 
     if "DenseNet169" in args.net:
@@ -137,30 +161,42 @@ def train(args):
 
     base_network = base_network.cuda()      # 将模型迁移到GPU上
 
-    # get embedding dimension   隐式语义维度256 
-    emb_dim = args.edim
-    # define MLP regressor for each dimension   
-    mlps = []
+    ## MLPS setting 
+    emb_dim = args.edim     # get embedding dimension--隐式语义维度
+    MLPS = []
     mlp_paras = []
     # MLPS的个数，就是emb_dim值
     for i in range(emb_dim):     
-        mlps.append(en_network.MLP_regressor(base_network.bottleneck_dim, 128).cuda())    # 将多个单隐层MLP添加到列别mlps中
-        mlp_paras = mlp_paras + mlps[i].get_parameters()   # 添加单隐层MLP的网络参数 
+        MLPS.append(en_network.MLP_regressor(base_network.bottleneck_dim, 128).cuda())    # 将多个单隐层MLPS添加到列别mlps中
+        mlp_paras = mlp_paras + MLPS[i].get_parameters()   # 添加单隐层MLP的网络参数 
 
-    ad_net = en_network.AdversarialNetwork(base_network.output_num(), 1024, args.max_iter).cuda()   # 对抗网络 
-    parameter_list = base_network.get_parameters() + ad_net.get_parameters() + mlp_paras
+    AD_NET = en_network.AdversarialNetwork(base_network.output_num(), 1024, args.max_iter).cuda()   # 对抗网络 
+    C= en_network.StochasticClassifier(base_network.output_num(), args.class_num).cuda()
 
-    ## set optimizer  -- 优化器
-    optimizer_config = {"type":torch.optim.SGD, 
-                        "optim_params":{'lr':args.lr, "momentum":0.9, "weight_decay":5e-4, "nesterov":True}, 
-                        "lr_type":"inv",
-                        "lr_param":{"lr":args.lr, "gamma":0.001, "power":0.75}
+    parameter_list = base_network.get_parameters() + AD_NET.get_parameters() + mlp_paras + C.get_parameters()
+
+    ## optimizer setting 
+    optimizer_config = {
+        "type":torch.optim.SGD, 
+        "optim_params":{
+            'lr':args.lr, 
+            "momentum":0.9, 
+            "weight_decay":5e-4, 
+            "nesterov":True
+        }, 
+        "lr_type":"inv",
+        "lr_param":{
+            "lr":args.lr, 
+            "gamma":0.001, 
+            "power":0.75
+        }
     }
-    optimizer = optimizer_config["type"](parameter_list,**(optimizer_config["optim_params"]))   # 定义了一个SGD优化器
+    ## optimizer create
+    optimizer = optimizer_config["type"](
+        parameter_list,
+        **(optimizer_config["optim_params"])
+    )  
 
-    param_lr = []
-    for param_group in optimizer.param_groups:
-        param_lr.append(param_group["lr"])
     schedule_param = optimizer_config["lr_param"]
     lr_scheduler = lr_schedule.schedule_dict[optimizer_config["lr_type"]]
 
@@ -174,21 +210,34 @@ def train(args):
 
     for i in tqdm(range(args.max_iter + 1), desc="Running Iterations", unit="iter"): 
         base_network.train(True)
-        ad_net.train(True)
+        AD_NET.train(True)
+        C.train(True)
         optimizer = lr_scheduler(optimizer, i, **schedule_param)
 
-        for mlp in mlps:
+        for mlp in MLPS:
             mlp.train(True)
 
         if (i % args.test_interval == 0 and i > 0) or (i == args.max_iter):    
                                                 
-            base_network.train(False)                                                                 # obtain the class-level weight and evalute the current model   测试当前训练模型的准确率
-            temp_acc, class_weight, mean_ent = image_test_classification(dset_loaders, base_network)  # 计算当前模型的准确率,输入字典，只用到dset_loaders["test"]中的数据
+            base_network.train(False) 
+            C.train(False)                                                                # obtain the class-level weight and evalute the current model   测试当前训练模型的准确率
+            temp_acc, class_weight, mean_ent = image_test_classification(dset_loaders, base_network, C)  # 计算当前模型的准确率,输入字典，只用到dset_loaders["test"]中的数据
+            base_network.train(True)
+            C.train(True)
             class_weight = class_weight.cuda().detach()                                               # 复制预测的类级权重class_weight-（test data中各类别的占比（会随着迭代的增加而变化）)
                                                             
             if  mean_ent < best_ent:
                 best_ent, best_acc = mean_ent, temp_acc                                         # 若当前分类的平均熵 低于历史最低平均，那么进行替换
-                best_model = base_network.copy.deepcopy()                                          # 将当前模型base_network的所有网络参数保存 
+                best_model = {
+                    "base_network":copy.deepcopy(base_network.state_dict()),
+                    "classifier":copy.deepcopy(C.state_dict()),
+                    "best_acc": best_acc,
+                    "best_ent": best_ent,
+                    "net": args.net,
+                    "class_num": args.class_num,
+                    "classifier_num": args.classifiers_num
+                    }
+                                                       # 将当前模型base_network的所有网络参数保存 
                 no_improve_epochs = 0 
             # early stop
             else:
@@ -213,93 +262,87 @@ def train(args):
                                                                 
         inputs_source, inputs_target, labels_source = inputs_source.cuda(), inputs_target.cuda(), labels_source.cuda()  # 作为网络训练的输入
 
-        if class_weight is not None and args.weight_cls and class_weight[labels_source].sum() == 0:
+        if class_weight is not None and class_weight[labels_source].sum() == 0:
             continue
 
-        features_source, outputs_source, e_s, r_s = base_network(inputs_source)  # 源域数据输入骨干网络后的输出
-        features_target, outputs_target, e_t, r_t = base_network(inputs_target)  
+
+        fea_s, e_s, r_s = base_network(inputs_source)  # 源域数据输入base网络后的输出
+        fea_t, e_t, r_t = base_network(inputs_target)  
+        features = torch.cat((fea_s, fea_t), dim=0)
+
 
 
         '''
-        这部分是对数据进行一个拼接，便于计算
+        计算自编码器class2vec的误差loss 
         '''
-        features = torch.cat((features_source, features_target), dim=0)
-        outputs = torch.cat((outputs_source, outputs_target), dim=0)
         embeddings = torch.cat((e_s, e_t), dim=0)
         recons = torch.cat((r_s, r_t), dim=0)
-
         f_dims = []
         e_dims = []
         for j in range(emb_dim):   
             f_dims.append(features.detach().clone().requires_grad_(True).cuda())   # .requires_grad_(True) 是计算注意力权重的关键设置
             e_dims.append(embeddings[:, j].detach().clone().cuda())   # 取所有样本在第 j 维上的 embedding 值 放到embeddings[j]上
 
-        '''
-        计算自编码器class2vec的误差loss 
-        '''
         rc_loss = F.mse_loss(features, recons)   # 计算均方误差，backbone网络提取的特征X 与 编码解码后输出的X之间的重构误差
 
         '''
         多层感知机gj的损失函数Loss_reg 
         '''
-        # # MLP to get gradients   
         l1_weight = 0.5         # L1正则化权重系数
-        mlp_losses = 0.0
-        for j in range(emb_dim):
-            l1_penalty = l1_weight * sum([p.abs().sum() for p in mlps[j].hidden_1.parameters()]) # 计算L1 正则化项--计算mlps组第j个单隐层感知机的全部参数的绝对值之和
-            prediction = mlps[j](f_dims[j]) 
-            mlp_loss = F.mse_loss(prediction.view(-1), e_dims[j]) + l1_penalty   # 计算预测值与原编码后的 e_dims[j] 之间的均方误差损失+ L1正则化项，对应公式（2） 
-            mlp_losses += mlp_loss
+        mlp_losses = my_loss.MLP_Reg_Loss(MLPS, f_dims, e_dims, l1_weight) 
+        optimizer.zero_grad()        
+        mlp_losses.backward()    
 
-        mlp_losses /= emb_dim        # mlp_losses / emb_dim： 平均损失
-        optimizer.zero_grad()       
-        mlp_losses.backward()       
         '''
         语义topic对齐
         '''
-        # alignment for each dimension in f
-        align_losses = 0.0
-        for j in range(emb_dim):
-            absolute_grad = torch.abs(f_dims[j].grad.data)  
-            absolute_grad = absolute_grad.div(absolute_grad.norm(p=2, keepdim=True)/(features_source.size(0) + features_target.size(0)))
-            att_features = torch.mul(features, absolute_grad)  #  features（维度：bottleneck_dim） 和 absolute_grad 进行逐元素相乘，得到注意力特征 att_features----注意力特征掩码Mj
+        align_losses = my_loss.Semantic_Alignment_Loss(
+            features,
+            f_dims,
+            fea_s.size(0),
+            fea_t.size(0)
+        )
 
-            # get the attention features for this dim
-            att_s = att_features[:features_source.size()[0]]   # 通过序列切片操作
-            att_t = att_features[features_source.size()[0]:]
-
-            source_mean = torch.mean(att_s, 0)  # 源域注意力特征在每个维度上的均值。
-            target_mean = torch.mean(att_t, 0)
-                
-            align_loss = F.mse_loss(source_mean, target_mean)
-            align_losses += align_loss
-
-        cls_weight = torch.ones(outputs.size(0)).cuda()  # 一个全为1的张量 cls_weight，其长度等于 outputs 的样本数量
+        cls_weight = torch.ones(features.size(0)).cuda()  # 一个全为1的张量 cls_weight
         if class_weight is not None:
             cls_weight[0:train_bs] = class_weight[labels_source]        # 因为打乱了source_的样本，所以每一个样本的对应的类级权重都是不一样的
 
+
         '''
+        Stochastic classifier avg prediction
+
         源域交叉熵损失*类级权重
         '''
-        if class_weight is not None: 
-            src_ = torch.nn.CrossEntropyLoss(reduction='none')(outputs_source, labels_source)  # 计算每个源域样本的交叉熵损失，用源域数据训练分类器  
-            weight = class_weight[labels_source].detach()
-            src_loss = torch.sum(weight * src_) / (1e-8 + torch.sum(weight).item())    # 对这批训练样本的交叉熵损失进行加权+平均：每个样本的交叉熵损失乘以对应的类别权重，然后除以所有权重之和，得到平均损失
-        else:
-            src_loss = torch.nn.CrossEntropyLoss()(outputs_source, labels_source)     # 在第一次test之前，使用标准交叉熵损失
+        probs_sum = 0.0
+        src_loss_sum = 0.0
+        for _ in range(args.classifiers_num):        
+
+            logits, probs = get_Classifier_logits_probs(C, features)
+            probs_sum += probs
+
+            if class_weight is not None: 
+                src_ = torch.nn.CrossEntropyLoss(reduction='none')(logits[:fea_s.size(0)], labels_source)  # reduction 控制是否自动计算所有样本损失的平均
+                weight = class_weight[labels_source].detach()
+                src_loss = torch.sum(weight * src_) / (1e-8 + torch.sum(weight).item())    # 交叉熵损失进行加权+平均
+            else:
+                src_loss = torch.nn.CrossEntropyLoss()(logits[:fea_s.size(0)], labels_source)     # 在第一次test之前，使用标准交叉熵损失
+            # every classifier loss summation
+            src_loss_sum += src_loss
+        
+        src_loss = src_loss_sum / args.classifiers_num   # K 次采样交叉熵损失的平均
+        probs_avg = probs_sum / args.classifiers_num     # K 次采样概率的平均
 
         '''
         DANN损失函数transfer_loss 
         '''
-        softmax_out = torch.nn.Softmax(dim=1)(outputs)    # output：（batch_size, class_num） 对output第二维度进行softmax，就是对每一个样本的输出转换为概率，使得样本对应所有类别的概率之和为1
-        entropy = my_loss.Entropy(softmax_out)           # 计算信息熵（数据的混乱程度）
-        transfer_loss = my_loss.DANN_Loss(features, ad_net, entropy, en_network.calc_coeff(i, 1, 0, 10, args.max_iter), cls_weight)   
+        entropy = my_loss.Entropy(probs_avg)           # 计算信息熵（预测概率向量所包含信息的混乱程度）
+        transfer_loss = my_loss.DANN_Loss(features, AD_NET, entropy, en_network.calc_coeff(i, 1, 0, 10, args.max_iter), cls_weight)   
         
         '''
         目标域样本的预测信息熵tar_loss
         '''
-        softmax_tar_out = torch.nn.Softmax(dim=1)(outputs_target)   
-        tar_loss = torch.mean(my_loss.Entropy(softmax_tar_out))   
+        probs_t = probs_avg[fea_s.size(0):]
+        tar_loss = torch.mean(my_loss.Entropy(probs_t))   
         
         '''
         总损失total_loss
@@ -313,19 +356,8 @@ def train(args):
      
         total_loss.backward()  
         optimizer.step()  
-    snr = (args.t-1)*5
-    file_name = f"TD_{args.multi_class}class_SNR_{snr}_best_model_en.pt"
 
-    save_dir = os.path.join('model',f'{args.net}')
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    model_path = os.path.join(save_dir, file_name)
-    try:
-        torch.save(best_model, model_path)
-        print(f"model is saved in: {model_path}")
-    except Exception as e:
-        print(f"model is not saved: {e}")
+    savemodel(best_model, args)
 
     log_str = 'Acc: ' + str(np.round(best_acc*100, 2)) + "\n" + 'Mean_ent: ' + str(np.round(best_ent, 3)) + '\n'
     print(log_str)
@@ -345,12 +377,13 @@ if __name__ == "__main__":
     parser.add_argument('--worker', type=int, default=8, help="number of workers") 
     parser.add_argument('--net', type=str, default='ResNet50', help=["ResNet50", "VGG16", "ResNet101", "ResNet152", "RepVGG_B1g2"])
     
-    parser.add_argument('--dset', type=str, default='ads-b')  # , choices=["office", "office_home", "imagenet_caltech"]
+    parser.add_argument('--dset', type=str, default='LongSig_50')  # , choices=["office", "office_home", "imagenet_caltech"]
     parser.add_argument('--cls_type', type=str, default='fixed_30class', help="  fixed_30class, Multi_class, Train10_Test0 ")
     parser.add_argument('--multi_class', type=str, default='30', help=" Target class num = 10, 15, 20, 25, 30")   
     parser.add_argument('--K', type=int, default=5, help="Top-K") 
     parser.add_argument('--momentum', type=float, default=0.9)    
     parser.add_argument('--early_stop', type=int, default=15, help="early stop") 
+    parser.add_argument('--classifiers_num', type=int, default=3, help="classifier num") 
     
     parser.add_argument('--lr', type=float, default=0.001, help="learning rate")
     parser.add_argument('--ent_weight', type=float, default=0.1)

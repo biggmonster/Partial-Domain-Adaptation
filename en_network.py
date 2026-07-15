@@ -46,7 +46,7 @@ resnet_dict = {
 }
 
 class ResNetFc(nn.Module):
-  def __init__(self, resnet_name, use_bottleneck=True, bottleneck_dim=512, new_cls=False, class_num=1000, embedding_dim=256):
+  def __init__(self, resnet_name, use_bottleneck=True, bottleneck_dim=512, new_cls=False,  embedding_dim=256):
     super(ResNetFc, self).__init__()
     model_resnet = resnet_dict[resnet_name](weights=resnet_weights_dict[resnet_name])   # 预训练模型参数  
 
@@ -87,18 +87,9 @@ class ResNetFc(nn.Module):
     if new_cls:        # 论文使用分类器True
         if self.use_bottleneck:     # 论文使用瓶颈层：将特征维度压缩到bottleneck_dim
             self.bottleneck = nn.Linear(model_resnet.fc.in_features, bottleneck_dim)    # model_resnet.fc.in_features表示平均池化avgpool后的特征：2048
-            self.fc = nn.Linear(bottleneck_dim, class_num)   # 全连接层fc 用于进行最后一步分类--输出的是得分，不是概率，因为没有进行激活函数转换
 
-            self.bottleneck.apply(init_weights)              # 对两个新的网络层进行初始化，其余层使用预训练的参数
-            self.fc.apply(init_weights)
+            self.bottleneck.apply(init_weights)              # 对新的网络层进行初始化，其余层使用预训练的参数
             self.__in_features = bottleneck_dim
-        else:
-            self.fc = nn.Linear(model_resnet.fc.in_features, class_num)     # 全连接层，初始化参数, 没有使用，可以不理会
-            self.fc.apply(init_weights)
-            self.__in_features = model_resnet.fc.in_features
-    else:
-        self.fc = model_resnet.fc          # 这是ResNet50原来的最后一层--全连接层，且使用预训练参数
-        self.__in_features = model_resnet.fc.in_features
   
   '''
   ResNet50_feature_layers   --> 瓶颈层 bottleneck + fc
@@ -111,8 +102,7 @@ class ResNetFc(nn.Module):
         x = self.bottleneck(x)
         e = self.encoder(x)   # 编码输出，维度（ batch_size, embedding_dim ）  e- encoder
         r = self.decoder(e)   # 解码输出，维度（ batch_size, bottleneck_dim ） r- decoder
-    y = self.fc(x)     # 分类结果 维度：（batch_size, class_num）
-    return x, y, e, r
+    return x, e, r
 
   def output_num(self):
     return self.__in_features   # 指输出的X特征维度，而不是隐式语义特征维度
@@ -130,12 +120,7 @@ class ResNetFc(nn.Module):
                             {"params":self.bottleneck.parameters(), "lr_mult":10, 'decay_mult':2}, \
                             {"params":self.encoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
                             {"params":self.decoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
-                            {"params":self.fc.parameters(), "lr_mult":10, 'decay_mult':2}]
-        else:
-            parameter_list = [{"params":self.feature_layers.parameters(), "lr_mult":1, 'decay_mult':2}, \
-                            {"params":self.fc.parameters(), "lr_mult":10, 'decay_mult':2}]
-    else:
-        parameter_list = [{"params":self.parameters(), "lr_mult":1, 'decay_mult':2}]
+                            ]
     return parameter_list
 
 
@@ -197,7 +182,7 @@ def load_model_repvgg_B1g2_weights():
     return model_repvgg
 
 class RepVGG_B1g2(nn.Module):
-    def __init__(self, use_bottleneck=True, bottleneck_dim=512, new_cls=False, class_num=1000, embedding_dim=256, use_checkpoint=False):
+    def __init__(self, use_bottleneck=True, bottleneck_dim=512, new_cls=False, embedding_dim=256, use_checkpoint=False):
         super (RepVGG_B1g2, self).__init__()
         model_repvgg = load_model_repvgg_B1g2_weights()
         self.stage0 = model_repvgg.stage0
@@ -222,13 +207,10 @@ class RepVGG_B1g2(nn.Module):
         self.new_cls = new_cls 
 
         self.bottleneck = nn.Linear(model_repvgg.linear.in_features, bottleneck_dim)    # model_resnet.fc.in_features表示平均池化avgpool后的特征：2048
-        self.fc = nn.Linear(bottleneck_dim, class_num)   
-
 
         self.bottleneck.apply(init_weights)              
         self.fc.apply(init_weights)
         self.__in_features = bottleneck_dim 
-
 
     def forward(self, x):
         out = self.stage0(x)
@@ -246,9 +228,7 @@ class RepVGG_B1g2(nn.Module):
             e = self.encoder(x)   
             r = self.decoder(e)  
 
-        y = self.fc(x)     # 分类结果 维度：（batch_size, class_num）
-        return x, y, e, r
-
+        return x, e, r
 
     def output_num(self):
         return self.__in_features   
@@ -259,7 +239,6 @@ class RepVGG_B1g2(nn.Module):
     def embedding_dim(self):
         return self.encoder[0].out_features
                 
-
     def get_parameters(self):
         parameter_list = [
                         {"params":self.stage0.parameters(), "lr_mult":1, 'decay_mult':2}, \
@@ -269,8 +248,8 @@ class RepVGG_B1g2(nn.Module):
                         {"params":self.stage4.parameters(), "lr_mult":1, 'decay_mult':2}, \
                         {"params":self.bottleneck.parameters(), "lr_mult":10, 'decay_mult':2}, \
                         {"params":self.encoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
-                        {"params":self.decoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
-                        {"params":self.fc.parameters(), "lr_mult":10, 'decay_mult':2}]
+                        {"params":self.decoder.parameters(), "lr_mult":10, 'decay_mult':2}
+                        ]
         
         return parameter_list 
 
@@ -374,7 +353,7 @@ vgg_weights_dict = {
 
 
 class VGGFc(nn.Module):
-  def __init__(self, vgg_name, use_bottleneck=True, bottleneck_dim=256, new_cls=False, class_num=1000, embedding_dim=128):
+  def __init__(self, vgg_name, use_bottleneck=True, bottleneck_dim=256, new_cls=False, embedding_dim=128):
     super(VGGFc, self).__init__()
     model_vgg = vgg_dict[vgg_name](weights=vgg_weights_dict[vgg_name])
     self.features = model_vgg.features
@@ -398,17 +377,11 @@ class VGGFc(nn.Module):
     if new_cls:
         if self.use_bottleneck:
             self.bottleneck = nn.Linear(4096, bottleneck_dim)
-            self.fc = nn.Linear(bottleneck_dim, class_num)
+    
             self.bottleneck.apply(init_weights)
-            self.fc.apply(init_weights)
+
             self.__in_features = bottleneck_dim
-        else:
-            self.fc = nn.Linear(4096, class_num)
-            self.fc.apply(init_weights)
-            self.__in_features = 4096
-    else:
-        self.fc = model_vgg.classifier[6]
-        self.__in_features = 4096
+
 
   def forward(self, x):
     x = self.features(x)
@@ -418,8 +391,8 @@ class VGGFc(nn.Module):
         x = self.bottleneck(x)
         e = self.encoder(x)
         r = self.decoder(e)
-    y = self.fc(x)
-    return x, y, e, r
+
+    return x, e, r
 
   def output_num(self):
     return self.__in_features
@@ -438,11 +411,11 @@ class VGGFc(nn.Module):
                             {"params":self.bottleneck.parameters(), "lr_mult":10, 'decay_mult':2}, \
                             {"params":self.encoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
                             {"params":self.decoder.parameters(), "lr_mult":10, 'decay_mult':2}, \
-                            {"params":self.fc.parameters(), "lr_mult":10, 'decay_mult':2}]
+                            ]
         else:
             parameter_list = [{"params":self.feature_layers.parameters(), "lr_mult":1, 'decay_mult':2}, \
                             {"params":self.classifier.parameters(), "lr_mult":1, 'decay_mult':2}, \
-                            {"params":self.fc.parameters(), "lr_mult":10, 'decay_mult':2}]
+                            ]
     else:
         parameter_list = [{"params":self.parameters(), "lr_mult":1, 'decay_mult':2}]
     return parameter_list
@@ -506,27 +479,14 @@ class MLP_regressor(torch.nn.Module):    # 单隐层的多层感知机模型
   
 
 
-
-def init_weights(m):                    # 权重初始化函数 不同网络层初始化的不同方式，有助于快速收敛
-    classname = m.__class__.__name__
-    if classname.find('Conv2d') != -1 or classname.find('ConvTranspose2d') != -1:  # 卷积层
-        nn.init.kaiming_uniform_(m.weight)
-        nn.init.zeros_(m.bias)
-    elif classname.find('BatchNorm') != -1:   # 批量归一化层
-        nn.init.normal_(m.weight, 1.0, 0.02) 
-        nn.init.zeros_(m.bias)
-    elif classname.find('Linear') != -1:      # 全连接层
-        nn.init.xavier_normal_(m.weight)
-        nn.init.zeros_(m.bias)
-
 class StochasticClassifier(nn.Module):
     '''
     StochasticClassifier
     '''
-    def __init__(self, feature_dim, block_expansion, num_classes):
+    def __init__(self, feature_dim, num_classes):
         super(StochasticClassifier, self).__init__()
-        self.mean = nn.Linear(feature_dim * block_expansion, num_classes) # 平均权重 高斯分布的均值μ
-        self.std = nn.Linear(feature_dim * block_expansion, num_classes)  # 扰动幅度 高斯分布的方差σ
+        self.mean = nn.Linear(feature_dim , num_classes) # 平均权重 高斯分布的均值μ
+        self.std = nn.Linear(feature_dim , num_classes)  # 扰动幅度 高斯分布的方差σ
         
         self.apply(init_weights)
 
@@ -542,9 +502,13 @@ class StochasticClassifier(nn.Module):
             weight = self.mean.weight + self.std.weight * e_weight
             bias = self.mean.bias + self.std.bias * e_bias
 
-        # 等价于 F.linear(x, weight, bias) 
+        # 等价于 F.linear(x, weight, bias) --> logits
         out = torch.matmul(x, weight.t()) + bias
         return out
+    
+    def get_parameters(self):
+        return [{"params": self.parameters(), "lr_mult":10, 'decay_mult':2}]
+    
 
     '''
     torch.randn( torch.size([30,512]) )    
