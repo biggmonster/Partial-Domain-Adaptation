@@ -9,6 +9,7 @@ __pycache__/
 
 # Data, checkpoints, models, and run outputs
 data/
+gasf_preview/
 ckp/
 model/
 pre_train/
