@@ -8,6 +8,7 @@ import os
 from utils.GASF import (
     Mat73SignalReader,
     SignalAugmentConfig,
+    add_measured_awgn,
     augment_iq,
     iq_to_pil,
 )
@@ -134,6 +135,7 @@ class MatSourceGASFDataset(Dataset):
         samples_per_class=1000,
         augment_config=None,
         contrastive=True,
+        snr_db=None,
     ):
         self.records = [(int(index), int(label)) for index, label in records]
         self.transform = transform
@@ -141,6 +143,9 @@ class MatSourceGASFDataset(Dataset):
         self.seed = int(seed)
         self.augment_config = augment_config or SignalAugmentConfig()
         self.contrastive = bool(contrastive)
+        self.snr_db = None if snr_db is None else float(snr_db)
+        if self.snr_db is not None and not np.isfinite(self.snr_db):
+            raise ValueError(f"snr_db must be finite or None, got {snr_db!r}")
         self.signal_reader = Mat73SignalReader(
             mat_path, samples_per_class=samples_per_class
         )
@@ -169,6 +174,14 @@ class MatSourceGASFDataset(Dataset):
                 f"Label mismatch at MAT index {mat_index}: "
                 f"record={target}, mat={actual_label}"
             )
+
+        # Fixed domain noise is deterministic per MAT sample and independent
+        # of worker scheduling, shuffling, epochs and augmentation RNG state.
+        if self.snr_db is not None:
+            noise_rng = np.random.default_rng(
+                np.random.SeedSequence([self.seed, mat_index])
+            )
+            signal = add_measured_awgn(signal, self.snr_db, noise_rng)
         
         # 生成原始GASF
         original = iq_to_pil(signal, target_size=self.gasf_size)
@@ -187,4 +200,3 @@ class MatSourceGASFDataset(Dataset):
 
     def __len__(self):
         return len(self.records)
-

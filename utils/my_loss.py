@@ -118,6 +118,65 @@ def LabelGuidedContrastiveLoss(
         symmetric_loss = 0.5 * (loss_original + loss_augmented)
         return symmetric_loss[valid_anchors].mean().clamp_min(0.0)
 
+def StochasticClassifierLoss(
+    classifier,
+    features,
+    source_labels,
+    classifiers_num,
+    class_weight=None,
+):
+    """Average stochastic predictions and compute source-only CE loss.
+
+    ``features`` contains source features followed by target features. Only
+    the leading ``source_labels.size(0)`` logits contribute to ``src_loss``,
+    while ``probs_avg`` retains predictions for the complete source and
+    target batch.
+    
+    output:
+       src_loss
+                ↓
+            只监督源域样本的类别分类
+                ↓
+            主要更新源域特征提取网络和随机分类器
+
+        probs_avg
+                ↓
+            同时保留源域与目标域的平均预测
+                ↓
+            可用于目标域熵损失、类别权重计算和对抗域适应损失 
+    """
+
+
+    sample_weights = None
+    if class_weight is not None:
+        sample_weights = class_weight[source_labels].detach()
+
+    source_size = source_labels.size(0)
+    probs_sum = 0.0
+    src_loss_sum = 0.0
+    for _ in range(classifiers_num):
+        logits = classifier(features)
+        source_logits = logits[:source_size]
+
+        probs = F.softmax(logits, dim=1)
+        probs_sum += probs
+
+        # 不加权
+        if sample_weights is None:
+            sampled_src_loss = F.cross_entropy(source_logits, source_labels)
+        # 加权
+        else:
+            per_sample_loss = F.cross_entropy(source_logits, source_labels, reduction="none")
+            sampled_src_loss = torch.sum(sample_weights * per_sample_loss) / (
+                1e-8 + torch.sum(sample_weights).item()
+            )
+
+        src_loss_sum += sampled_src_loss
+
+    src_loss = src_loss_sum / classifiers_num 
+    probs_avg = probs_sum / classifiers_num 
+    return src_loss, probs_avg
+
 def Entropy(input_):           # 计算输入张量的熵--数据的混乱程度 论文《A Balanced and Uncertainty-aware》 公式（2）上两行
     bs = input_.size(0)
     entropy = -input_ * torch.log(input_ + 1e-7)

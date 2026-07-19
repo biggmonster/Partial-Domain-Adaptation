@@ -480,6 +480,28 @@ class MLP_regressor(torch.nn.Module):    # 单隐层的多层感知机模型
         return [{"params": self.parameters(), "lr_mult":1, 'decay_mult':10}]
 
 
+class MLPS_regressores(torch.nn.Module):    # 多个MLP回归器
+    def __init__(self, num_mlps, n_feature, n_hidden_1):
+        super(MLPS_regressores, self).__init__()
+        self.mlps = torch.nn.ModuleList(
+            [MLP_regressor(n_feature, n_hidden_1) for _ in range(num_mlps)]
+        )
+
+    def append(self, mlp):
+        self.mlps.append(mlp)
+
+    def __len__(self):
+        return len(self.mlps)
+
+    def __getitem__(self, index):
+        return self.mlps[index]
+
+    def __iter__(self):
+        return iter(self.mlps)
+
+    def get_parameters(self):
+        return [{"params": self.parameters(), "lr_mult":1, 'decay_mult':10}]
+
 class ContrastiveProjectionHead(nn.Module):
     """Two-layer projection head used only by contrastive pretraining."""
 

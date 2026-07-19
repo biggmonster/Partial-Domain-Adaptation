@@ -67,14 +67,8 @@ def image_test_classification(loader, base_model, classifiers):
                 all_label = torch.cat((all_label, labels.float()), 0)
     _, predict = torch.max(all_output, 1)    # .max()选择了其中最大概率输出的类别标签  
     accuracy = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0])   # 准确率
-    mean_ent = torch.mean(my_loss.Entropy(torch.nn.Softmax(dim=1)(all_output))).cpu().data.item()           # 平均熵 维度[类别数量]，每一个元素值表示这个测试集样本的预测的混乱程度（置信度）
 
-    hist_tar = torch.nn.Softmax(dim=1)(all_output).sum(dim=0)   # 输入维度：all_output--[样本数量，类别数量]
-                                                                # nn.Softmax(dim=1)(all_output)表示对每一个样本预测输出进行归一化---将每一个样本的每一类的预测得分转换为预测概率
-                                                                # .sum(dim=0)表示 把所有样本，每一类对应下的预测概率进行求和
-                                                                # 输出的维度：hist_tar--[类别数量] 
-    hist_tar = hist_tar / hist_tar.sum()    # 每个类别占总类别的输出概率 （算是归一化了），用于表示一个类别在测试集中的比例
-    return accuracy, hist_tar, mean_ent
+    return accuracy 
 
 
 def get_Classifier_logits_probs(Classifiers, feat):
@@ -117,7 +111,6 @@ def train(args):
     '''
     dsets = {}
     dsets["source"] = data_list.ImageList(open(args.s_dset_path).readlines(), transform=image_train())   # open(path).readlines()返回列表，每个元素是文件中的一行内容
-    dsets["target"] = data_list.ImageList(open(args.t_dset_path).readlines(), transform=image_train())   # 目标域
     dsets["test"] = data_list.ImageList(open(args.test_dset_path).readlines(), transform=image_test())   # 测试集 
 
     '''
@@ -125,10 +118,9 @@ def train(args):
     '''
     dset_loaders = {}   
     dset_loaders["source"] = DataLoader(dsets["source"], batch_size=train_bs, shuffle=True, num_workers=args.worker, drop_last=True, pin_memory=True, persistent_workers= True)
-    dset_loaders["target"] = DataLoader(dsets["target"], batch_size=train_bs, shuffle=True, num_workers=args.worker, drop_last=True, pin_memory=True, persistent_workers= True)
     dset_loaders["test"]   = DataLoader(dsets["test"], batch_size=test_bs, shuffle=False, num_workers=args.worker, pin_memory=True, persistent_workers= True)
 
-    max_len = max(len(dset_loaders["source"]), len(dset_loaders["target"]))
+    max_len = len(dset_loaders["source"])
     args.max_iter = args.max_epoch * max_len
     args.test_interval = int(args.max_iter / 20) 
     print("max_len:", max_len)
@@ -137,35 +129,18 @@ def train(args):
     print()
 
     if "ResNet50" in args.net:
-        params = {"resnet_name":args.net, "use_bottlen"
-        "eck":True, "bottleneck_dim": args.fdim, "new_cls":True, "embedding_dim": args.edim}
+        params = {"resnet_name":args.net, "use_bottleneck":True, "bottleneck_dim": args.fdim, "new_cls":True, "embedding_dim": args.edim}
         base_network = en_network.ResNetFc(**params)   # **表示字典解包操作
-
-    if "VGG16" in args.net:
-        params = {"vgg_name":args.net, "use_bottleneck":True, "bottleneck_dim":args.fdim, "new_cls":True, "embedding_dim": args.edim}
-        base_network = en_network.VGGFc(**params)
 
     if "RepVGG_B1g2" in args.net:
         params = {"use_bottleneck":True, "bottleneck_dim":args.fdim, "new_cls":True, "embedding_dim": args.edim}
         base_network = en_network.RepVGG_B1g2(**params)
 
-
-
     base_network = base_network.cuda()      # 将模型迁移到GPU上
 
-    ## MLPS setting 
-    emb_dim = args.edim     # get embedding dimension--隐式语义维度
-    MLPS = []
-    mlp_paras = []
-    # MLPS的个数，就是emb_dim值
-    for i in range(emb_dim):     
-        MLPS.append(en_network.MLP_regressor(base_network.bottleneck_dim, 128).cuda())    # 将多个单隐层MLPS添加到列别mlps中
-        mlp_paras = mlp_paras + MLPS[i].get_parameters()   # 添加单隐层MLP的网络参数 
-                                            
-    AD_NET = en_network.AdversarialNetwork(base_network.output_num(), 1024, args.max_iter).cuda()   # 对抗网络 
     C= en_network.StochasticClassifier(base_network.output_num(), args.class_num).cuda()
 
-    parameter_list = base_network.get_parameters() + AD_NET.get_parameters() + mlp_paras + C.get_parameters()
+    parameter_list = base_network.get_parameters() + C.get_parameters()
 
     ## optimizer setting 
     optimizer_config = {
@@ -206,29 +181,25 @@ def train(args):
                   unit="iter"): 
         
         base_network.train(True)
-        AD_NET.train(True)
         C.train(True)
         optimizer = lr_scheduler(optimizer, i, **schedule_param)
 
-        for mlp in MLPS:
-            mlp.train(True)
 
         if (i % args.test_interval == 0 and i > 0) or (i == args.max_iter):    
                                                 
             base_network.train(False) 
             C.train(False)                                                                # obtain the class-level weight and evalute the current model   测试当前训练模型的准确率
-            temp_acc, class_weight, mean_ent = image_test_classification(dset_loaders, base_network, C)  # 计算当前模型的准确率,输入字典，只用到dset_loaders["test"]中的数据
+            temp_acc = image_test_classification(dset_loaders, base_network, C)  # 计算当前模型的准确率,输入字典，只用到dset_loaders["test"]中的数据
             base_network.train(True)
             C.train(True)
             class_weight = class_weight.cuda().detach()                                               # 复制预测的类级权重class_weight-（test data中各类别的占比（会随着迭代的增加而变化）)
                                                             
-            if  mean_ent < best_ent:
-                best_ent, best_acc = mean_ent, temp_acc                                         # 若当前分类的平均熵 低于历史最低平均，那么进行替换
+            if  best_acc < temp_acc:
+                best_acc = temp_acc                                         # 若当前分类的平均熵 低于历史最低平均，那么进行替换
                 best_model = {
                     "base_network":copy.deepcopy(base_network.state_dict()),                    # 将当前模型base_network的所有网络参数保存 
                     "classifier":copy.deepcopy(C.state_dict()),
                     "best_acc": best_acc,
-                    "best_ent": best_ent,
                     "net": args.net,
                     "class_num": args.class_num,
                     "classifier_num": args.classifiers_num
@@ -244,67 +215,23 @@ def train(args):
                 break  
             current_epoch = i // max_len
             print("current epoch: ", current_epoch)  
-            print("iter: {:05d}, precision: {:.5f}, best_acc:{:.5f}, mean_entropy: {:.5f}".format(i, temp_acc, best_acc, mean_ent))   
+            print("iter: {:05d}, precision: {:.5f}, best_acc:{:.5f}".format(i, temp_acc, best_acc))   
                                 
-
         try:
             inputs_source, labels_source, _ = next(iter_source)         # next()   每次调用next() 都会使迭代器内部指针向后移动一个批次
         except StopIteration:                                           # labels_source: 一串长度为batch_size的序列，里面的每个元素值是每一个样本的标签  
             iter_source = iter(dset_loaders["source"])
             inputs_source, labels_source, _ = next(iter_source)
-        try:
-            inputs_target, _, idx = next(iter_target)
-        except StopIteration:
-            iter_target = iter(dset_loaders["target"])
-            inputs_target, _, idx = next(iter_target)                                                                
+                                                             
                                                                 
-        inputs_source, inputs_target, labels_source = inputs_source.cuda(), inputs_target.cuda(), labels_source.cuda()  # 作为网络训练的输入
+        inputs_source, labels_source = inputs_source.cuda(), labels_source.cuda()  # 作为网络训练的输入
 
         if class_weight is not None and class_weight[labels_source].sum() == 0:
             continue
 
-
         fea_s, e_s, r_s = base_network(inputs_source)  # 源域数据输入base网络后的输出
-        fea_t, e_t, r_t = base_network(inputs_target)  
-        features = torch.cat((fea_s, fea_t), dim=0)
 
-
-
-        '''
-        计算自编码器class2vec的误差loss 
-        '''
-        embeddings = torch.cat((e_s, e_t), dim=0)
-        recons = torch.cat((r_s, r_t), dim=0)
-        f_dims = []
-        e_dims = []
-        for j in range(emb_dim):   
-            f_dims.append(features.detach().clone().requires_grad_(True).cuda())   # .requires_grad_(True) 是计算注意力权重的关键设置
-            e_dims.append(embeddings[:, j].detach().clone().cuda())   # 取所有样本在第 j 维上的 embedding 值 放到embeddings[j]上
-
-        rc_loss = F.mse_loss(features, recons)   # 计算均方误差，backbone网络提取的特征X 与 编码解码后输出的X之间的重构误差
-
-        '''
-        多层感知机gj的损失函数Loss_reg 
-        '''
-        l1_weight = 0.5         # L1正则化权重系数
-        mlp_losses = my_loss.MLP_Reg_Loss(MLPS, f_dims, e_dims, l1_weight) 
-        optimizer.zero_grad()        
-        mlp_losses.backward()    
-
-        '''
-        语义topic对齐
-        '''
-        align_losses = my_loss.Semantic_Alignment_Loss(
-            features,
-            f_dims,
-            fea_s.size(0),
-            fea_t.size(0)
-        )
-
-        cls_weight = torch.ones(features.size(0)).cuda()  # 一个全为1的张量 cls_weight
-        if class_weight is not None:
-            cls_weight[0:train_bs] = class_weight[labels_source]        # 因为打乱了source_的样本，所以每一个样本的对应的类级权重都是不一样的
-
+        features = fea_s.clone()
 
         '''
         Stochastic classifier avg prediction
@@ -329,27 +256,15 @@ def train(args):
         
         src_loss = src_loss_sum / args.classifiers_num   # K 次采样交叉熵损失的平均
         probs_avg = probs_sum / args.classifiers_num     # K 次采样概率的平均
-
-        '''
-        DANN损失函数transfer_loss 
-        '''
-        entropy = my_loss.Entropy(probs_avg)           # 计算信息熵（预测概率向量所包含信息的混乱程度）
-        transfer_loss = my_loss.DANN_Loss(features, AD_NET, entropy, en_network.calc_coeff(i, 1, 0, 10, args.max_iter), cls_weight)   
-        
-        '''
-        目标域样本的预测信息熵tar_loss
-        '''
-        probs_t = probs_avg[fea_s.size(0):]
-        tar_loss = torch.mean(my_loss.Entropy(probs_t))   
+  
         
         '''
         总损失total_loss
         '''
-        total_loss = src_loss + tar_loss * args.ent_weight + transfer_loss + rc_loss * args.rcwt + align_losses * args.alwt 
+        total_loss = src_loss 
 
         if (i % args.test_interval == 0 and i > 0) or (i == args.max_iter):
-            print("src :", src_loss.item(), ", Trans: ", transfer_loss.item(), ", Tar: ", args.ent_weight * tar_loss.item())             
-            print("rc :", rc_loss.item() * args.rcwt, ", align: ", align_losses.item() * args.alwt, "\n")
+            print("src :", src_loss.item(), ", Trans: ")             
             print_line()
      
         total_loss.backward()  
