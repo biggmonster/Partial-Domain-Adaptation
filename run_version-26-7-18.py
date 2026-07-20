@@ -26,7 +26,32 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def image_transform(resize_size=256, crop_size=224):
+def image_train_transform(resize_size=256, crop_size=224):
+    """Deterministic image conversion; augmentation is performed on I/Q only.
+    GASF RGB图片
+        ↓ 调整尺寸
+    256*256
+        ↓ 随机裁剪
+    224*224
+        ↓ 随机水平翻转
+        ↓ 转成PyTorch张量
+    [3,224,224]
+        ↓ ImageNet标准化
+    模型输入
+    """
+
+    return transforms.Compose(
+        [
+            transforms.Resize((resize_size, resize_size)),
+            transforms.RandomCrop(crop_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+def image_test_transform(resize_size=256, crop_size=224):
     """Deterministic image conversion; augmentation is performed on I/Q only.
     GASF RGB图片
         ↓ 调整尺寸
@@ -141,6 +166,28 @@ def make_augment_config(args):
     )
 
 
+def read_lines_and_validate(path, args):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    labels = [int(line.rsplit(maxsplit=1)[1]) for line in lines if line.strip()]
+    if not labels:
+        raise ValueError(f"No samples found in: {path}")
+
+    return [line + "\n" for line in lines if line.strip()], labels
+
+def make_loader_22222(lines, transform, args, shuffle, drop_last):
+    dataset = data_list.ImageList(lines, transform=transform)
+    args.target_class_ids = [0, 3, 5, 6, 7, 9, 10, 12, 14, 15, 20, 21, 25, 26, 28, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 43, 44, 45, 47, 49]
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.worker,
+        drop_last=drop_last,
+        pin_memory=True,
+        persistent_workers=args.worker > 0,
+    )
+
+
 def make_loaders(args, augment_config):
     '''
     读取MAT标签和结构
@@ -160,22 +207,21 @@ def make_loaders(args, augment_config):
         target_class_ids,
     ) = build_source_target_records(
         args.raw_mat_path,
-        args.class_num,
+        args.SD_class_num,
         args.samples_per_class,
         args.source_samples_per_class,
         args.target_samples_per_class,
-        args.multi_class,
+        args.TD_class_num,
         args.seed,
     )
     args.target_class_ids = target_class_ids
-    # train_records, validation_records = split_train_valid(
-    #     source_records, args.source_val_ratio, args.seed
-    # )
-    transform = image_transform(args.gasf_size, args.crop_size)
+
+    train_transform = image_train_transform(args.gasf_size, args.crop_size)
+    test_transform = image_test_transform(args.gasf_size, args.crop_size)
     SD_dataset = data_list.MatSourceGASFDataset(
         source_records,
         mat_path=args.raw_mat_path,
-        transform=transform,
+        transform=train_transform,
         gasf_size=args.gasf_size,
         seed=args.seed,
         samples_per_class=args.samples_per_class,
@@ -186,7 +232,7 @@ def make_loaders(args, augment_config):
     TD_dataset = data_list.MatSourceGASFDataset(
         target_records,
         mat_path=args.raw_mat_path,
-        transform=transform,
+        transform=train_transform,
         gasf_size=args.gasf_size,
         seed=args.seed,
         samples_per_class=args.samples_per_class,
@@ -194,7 +240,17 @@ def make_loaders(args, augment_config):
         contrastive=False,         # 在训练阶段不添加数据增强
         snr_db=args.t,
     ) 
-
+    test_dataset = data_list.MatSourceGASFDataset(
+        target_records,
+        mat_path=args.raw_mat_path,
+        transform=test_transform,
+        gasf_size=args.gasf_size,
+        seed=args.seed,
+        samples_per_class=args.samples_per_class,
+        augment_config=augment_config,
+        contrastive=False,         # 在训练阶段不添加数据增强
+        snr_db=args.t,
+    ) 
     common_loader_args = {
         "num_workers": args.worker,
         "pin_memory": True,
@@ -219,6 +275,13 @@ def make_loaders(args, augment_config):
         **common_loader_args,
     )
 
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=2* args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        **common_loader_args,
+    )
     print(
         f"MAT X shape: {mat_shape}; source uses the first "
         f"{args.source_samples_per_class}/{args.samples_per_class} samples per class; "
@@ -226,10 +289,10 @@ def make_loaders(args, augment_config):
         f"SD SNR={args.s} dB, TD SNR={args.t} dB"
     )
     print(
-        f"Target classes ({args.multi_class}/{args.class_num}): "
+        f"Target classes ({args.TD_class_num}/{args.SD_class_num}): "
         f"{target_class_ids}"
     )
-    return SD_loader, TD_loader
+    return SD_loader, TD_loader, test_loader
 
 
 def _reset_encoder_decoder(base_network):
@@ -291,7 +354,6 @@ def build_models(args, device):
             "resnet_name": args.net,
             "use_bottleneck": True,
             "bottleneck_dim": args.fdim,
-            "new_cls": True,
             "embedding_dim": args.edim,
         }
         base_network = en_network.ResNetFc(**parameters)
@@ -299,15 +361,17 @@ def build_models(args, device):
         parameters = {
             "use_bottleneck": True,
             "bottleneck_dim": args.fdim,
-            "new_cls": True,
             "embedding_dim": args.edim,
         }
         base_network = en_network.RepVGG_B1g2(**parameters)
     else:
         raise ValueError(f"Unsupported network: {args.net}")
 
-    classifier = en_network.StochasticClassifier(
-        base_network.output_num(), args.class_num
+    # classifier = en_network.StochasticClassifier(
+    #     base_network.output_num(), args.SD_class_num
+    # )
+    classifier = en_network.common_fc(
+        base_network.output_num(), args.SD_class_num
     )
     if args.pretrain_model_path:
         load_pretrained_checkpoint(
@@ -337,7 +401,7 @@ def classifier_loss(classifier, features, labels, samples):
     return loss / samples
 
 
-def image_test_classification(loader, base_model, classifiers):
+def image_test_stochastic_classification(loader, base_model, classifiers):
     start_test = True
     base_model.eval()
     classifiers.eval()
@@ -376,6 +440,45 @@ def image_test_classification(loader, base_model, classifiers):
     return accuracy, hist_tar, mean_ent
 
 
+def image_test_classification(loader, base_model, classifiers):
+    start_test = True
+    base_model.eval()
+    classifiers.eval()
+    with torch.no_grad():  # 下述代码不进行梯度计算
+
+        iter_test = iter(loader)       # 测试集中batch_size*2 
+        total_samples_iter = 0
+        for i in range(len(loader)):   # 会遍历一个epoch全部目标域都测试一遍   
+            data = next(iter_test)             # iter_test.next()返回一个batch的数据
+            inputs = data[0]
+            labels = data[1]
+            
+            batch_size_flag = inputs.shape[0]   # 用于查验test的样本数目
+            total_samples_iter += batch_size_flag
+
+            inputs = inputs.cuda()  # 
+            out_f,  _, _ = base_model(inputs) # 模型输出特征
+            outputs = classifiers(out_f)
+
+            if start_test:
+                all_output = outputs.float().cpu()
+                all_label = labels.float()   #
+                start_test = False   
+            else:
+                all_output = torch.cat((all_output, outputs.float().cpu()), 0) 
+                all_label = torch.cat((all_label, labels.float()), 0)
+    _, predict = torch.max(all_output, 1)    # .max()选择了其中最大概率输出的类别标签  
+    accuracy = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0])   # 准确率
+    mean_ent = torch.mean(my_loss.Entropy(torch.nn.Softmax(dim=1)(all_output))).cpu().data.item()           # 平均熵 维度[类别数量]，每一个元素值表示这个测试集样本的预测的混乱程度（置信度）
+
+    hist_tar = torch.nn.Softmax(dim=1)(all_output).sum(dim=0)   
+    hist_tar = hist_tar / hist_tar.sum()    # 每个类别占总类别的输出概率 （算是归一化了），用于表示一个类别在测试集中的比例
+    base_model.train()
+    classifiers.train()
+
+    return accuracy, hist_tar, mean_ent
+
+
 def save_checkpoint(
     checkpoint_path,
     args,
@@ -394,7 +497,8 @@ def save_checkpoint(
         "epoch": epoch,
         "seed": args.seed,
         "net": args.net,
-        "class_num": args.class_num,
+        "SD_class_num": args.SD_class_num,
+        "TD_class_num": args.TD_class_num,
         "classifier_num": args.classifiers_num,
         "domain_snr_db": {
             "source": float(args.s),
@@ -461,13 +565,24 @@ def print_epoch_summary(
     )
 
 
+
+
 def train(args):
 
     device = torch.device("cuda")
-    amp_enabled = bool(args.amp)
+    print("Training precision: FP32 (mixed precision disabled)")
     augment_config = make_augment_config(args)
 
-    SD_loader, TD_loader = make_loaders(args, augment_config)
+    # SD_loader, TD_loader = make_loaders(args, augment_config)
+    SD_lines, _ = read_lines_and_validate(args.SD_list.resolve(), args)
+    TD_lines, _ = read_lines_and_validate(args.TD_list.resolve(), args)
+
+    train_transform = image_train_transform(args.gasf_size, args.crop_size)
+    test_transform = image_test_transform(args.gasf_size, args.crop_size)
+    SD_loader = make_loader_22222(SD_lines, train_transform, args, shuffle=True, drop_last=True)
+    TD_loader = make_loader_22222(TD_lines, train_transform, args, shuffle=True, drop_last=True)
+    test_loader = make_loader_22222(TD_lines, test_transform, args, shuffle=False, drop_last=False)
+
 
     base_network, classifier = build_models(args, device)
     MLPS = en_network.MLPS_regressores(args.edim, base_network.bottleneck_dim, 128).to(device)
@@ -497,13 +612,12 @@ def train(args):
         "power": args.lr_power,
     }
     scheduler = lr_schedule.schedule_dict["inv"]
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_path = (
         Path(args.save_dir)
         / args.net
-        / f"SD_50class_SNR_{args.s}_TD_{args.multi_class}class_SNR_{args.t}.pt"
+        / f"SD_{args.SD_class_num}class_SNR_{args.s}_TD_{args.TD_class_num}class_SNR_{args.t}_{timestamp}.pt"
     )
     epochs_without_improvement = 0
     global_step = 0
@@ -537,11 +651,11 @@ def train(args):
         )
 
         test_interval_epoch = int(args.max_epoch / 20)
-        if epoch % test_interval_epoch == 0 or epoch == args.max_epoch:
+        if epoch > 2 and (epoch % test_interval_epoch == 0 or epoch == args.max_epoch):
             cur_accuracy, class_weight, cur_mean_entropy  = image_test_classification(
                 base_model=base_network, 
                 classifiers=classifier, 
-                loader=TD_loader
+                loader=test_loader
                 )
             class_weight = class_weight.cuda()
             if cur_mean_entropy < min_entropy:
@@ -558,7 +672,7 @@ def train(args):
                     base_network,
                     classifier,
                 )
-                print(f"TD-entropy improved to {min_entropy:.6f} at epoch {epoch}, accuracy={cur_accuracy:.6f}")
+                print(f"TD-entropy improved to {min_entropy:.6f} at epoch {epoch-1}, accuracy={cur_accuracy:.6f}")
                 print(f"Saved best model checkpoint: {checkpoint_path}")
             else:
                 epochs_without_improvement += test_interval_epoch
@@ -579,82 +693,79 @@ def train(args):
             optimizer = scheduler(optimizer, global_step, **schedule_parameters)
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled):       # 使用混合精度，自动选择计算精度
-                fea_s, e_s, r_s = base_network(SD_batch)  # 源域数据输入base网络后的输出
-                fea_t, e_t, r_t = base_network(TD_batch)  
-                features = torch.cat((fea_s, fea_t), dim=0)
+            fea_s, e_s, r_s = base_network(SD_batch)  # 源域数据输入base网络后的输出
+            fea_t, e_t, r_t = base_network(TD_batch)
+            features = torch.cat((fea_s, fea_t), dim=0)
 
-                '''
-                计算自编码器encoder-decoder的误差loss 
-                '''
-                embeddings = torch.cat((e_s, e_t), dim=0)
-                recons = torch.cat((r_s, r_t), dim=0)
-                f_dims = []
-                e_dims = []
-                for j in range(args.edim):   # 遍历每个embedding维度
-                    f_dims.append(features.detach().clone().requires_grad_(True).cuda())   # .requires_grad_(True) 是计算注意力权重的关键设置
-                    e_dims.append(embeddings[:, j].detach().clone().cuda())   # 取所有样本在第 j 维上的 embedding 值 放到embeddings[j]上
+            '''
+            计算自编码器encoder-decoder的误差loss
+            '''
+            embeddings = torch.cat((e_s, e_t), dim=0)
+            recons = torch.cat((r_s, r_t), dim=0)
+            f_dims = []
+            e_dims = []
+            for j in range(args.edim):   # 遍历每个embedding维度
+                f_dims.append(features.detach().clone().requires_grad_(True).cuda())   # .requires_grad_(True) 是计算注意力权重的关键设置
+                e_dims.append(embeddings[:, j].detach().clone().cuda())   # 取所有样本在第 j 维上的 embedding 值 放到embeddings[j]上
 
-                rc_loss = F.mse_loss(features, recons)   # 计算均方误差，backbone网络提取的特征X 与 编码解码后输出的X之间的重构误差
+            rc_loss = F.mse_loss(features, recons)   # 计算均方误差，backbone网络提取的特征X 与 编码解码后输出的X之间的重构误差
 
+            '''
+            多层感知机gj的损失函数Loss_reg
+            '''
+            l1_weight = 0.5         # L1正则化权重系数
+            mlp_losses = my_loss.MLP_Reg_Loss(MLPS, f_dims, e_dims, l1_weight)
+            optimizer.zero_grad()
+            mlp_losses.backward()
 
-                '''
-                多层感知机gj的损失函数Loss_reg 
-                '''
-                l1_weight = 0.5         # L1正则化权重系数
-                mlp_losses = my_loss.MLP_Reg_Loss(MLPS, f_dims, e_dims, l1_weight) 
-                optimizer.zero_grad()        
-                mlp_losses.backward()    
+            '''
+            语义topic对齐
+            '''
+            align_losses = my_loss.Semantic_Alignment_Loss(
+                features,
+                f_dims,
+                fea_s.size(0),
+                fea_t.size(0)
+            )
 
-                '''
-                语义topic对齐
-                '''
-                align_losses = my_loss.Semantic_Alignment_Loss(
+            cls_weight = torch.ones(features.size(0)).cuda()  # 一个全为1的张量 cls_weight
+            if class_weight is not None:
+                cls_weight[0:fea_s.size(0)] = class_weight[SD_label]
+
+            '''
+            Stochastic classifier avg prediction
+
+            源域交叉熵损失*类级权重
+            '''
+            src_loss, probs_avg = my_loss.StochasticClassifierLoss(
+                    classifier,
                     features,
-                    f_dims,
-                    fea_s.size(0),
-                    fea_t.size(0)
-                )                
+                    SD_label,
+                    args.classifiers_num,
+                    class_weight
+            )
 
-                cls_weight = torch.ones(features.size(0)).cuda()  # 一个全为1的张量 cls_weight
-                if class_weight is not None:
-                    cls_weight[0:fea_s.size(0)] = class_weight[SD_label] 
+            '''
+            DANN损失函数transfer_loss
+            '''
+            entropy = my_loss.Entropy(probs_avg)           # 计算信息熵（预测概率向量所包含信息的混乱程度）
 
-                '''
-                Stochastic classifier avg prediction
+            transfer_loss = my_loss.DANN_Loss(features, AD_NET, entropy, en_network.calc_coeff(global_step, 1, 0, 10, max_iter), cls_weight)
 
-                源域交叉熵损失*类级权重
-                '''
-                src_loss, probs_avg = my_loss.StochasticClassifierLoss(
-                        classifier,
-                        features,
-                        SD_label,
-                        args.classifiers_num,
-                        class_weight
-                )
+            '''
+            目标域样本的预测信息熵tar_loss
+            '''
+            probs_t = probs_avg[fea_s.size(0):]
+            tar_loss = torch.mean(my_loss.Entropy(probs_t))
 
-                '''
-                DANN损失函数transfer_loss 
-                '''
-                entropy = my_loss.Entropy(probs_avg)           # 计算信息熵（预测概率向量所包含信息的混乱程度）
+            total_loss = src_loss \
+                + tar_loss * args.tar_loss_weight \
+                + transfer_loss \
+                + rc_loss * args.rc \
+                + align_losses * args.align
 
-                transfer_loss = my_loss.DANN_Loss(features, AD_NET, entropy, en_network.calc_coeff(global_step, 1, 0, 10, max_iter), cls_weight)   
-                
-                '''
-                目标域样本的预测信息熵tar_loss
-                '''
-                probs_t = probs_avg[fea_s.size(0):]
-                tar_loss = torch.mean(my_loss.Entropy(probs_t))  
-
-                total_loss = src_loss \
-                    + tar_loss * args.tar_loss_weight \
-                    + transfer_loss  \
-                    + rc_loss * args.rc \
-                    + align_losses * args.align
-        
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            total_loss.backward()
+            optimizer.step()
 
 
             loss_totals, batches, global_step = update_epoch_metrics(
@@ -703,8 +814,10 @@ def build_parser():
     parser.add_argument("--output", type=str, default="run", help=argparse.SUPPRESS)
     parser.add_argument("--dset", type=str, default="LongSig_50", help=argparse.SUPPRESS)
     parser.add_argument("--cls_type", type=str, default="fixed_30class", help=argparse.SUPPRESS)
+    parser.add_argument("--classifiers_num", type=int, default=3)
+    parser.add_argument("--SD_class_num", type=int, default=50)
     parser.add_argument(
-        "--multi_class",
+        "--TD_class_num",
         type=int,
         default=30,
         help="Number of randomly selected target-domain classes",
@@ -713,12 +826,12 @@ def build_parser():
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--max_epoch", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=36)
     parser.add_argument("--worker", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--net", type=str, default="RepVGG_B1g2")
-    parser.add_argument("--class_num", type=int, default=50)
-    parser.add_argument("--classifiers_num", type=int, default=3)
+    
+    
     parser.add_argument("--early_stop", type=int, default=15)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr_gamma", type=float, default=0.001)
@@ -743,11 +856,36 @@ def build_parser():
         r"\extracted_50classes_1000samples.mat",
         help='raw I/Q signal'
     )
+    parser.add_argument(
+        "--SD_list",
+        type=Path,
+        default=
+        r"D:\LJ\workstation\Vscode\New_ISRA"
+        r"\data\LongSig_50"
+        r"\Source\GASF_old\SNR_20_list.txt",
+        help='MATLAB-GASF SD list file, each line: "gasf-image_path label"',
+    )
+    parser.add_argument(
+        "--TD_list",
+        type=Path,
+        default=
+        r"D:\LJ\workstation\Vscode\New_ISRA"
+        r"\data\LongSig_50"
+        r"\Target\Multi_class\SNR_0_30_list-test.txt",
+        help='MATLAB-GASF TD list file, each line: "gasf-image_path label"',
+    )
+
     
     parser.add_argument("--pretrain_model_path", type=Path,
-                        default=Path(r"model\RepVGG_B1g2\SD_50class_SNR_20_pretrain_20260717_203953.pt"),
+                        default=None,
+                        # default=Path(
+                        #     r"D:\LJ\workstation\Vscode\26-7-14"
+                        #     r"\model\RepVGG_B1g2"
+                        #     r"\SD_50class_SNR_20.0_pretrain_20260719_111232.pt"
+                        #     ),
                         help="Path to the pretrained model"
     )
+    
     parser.add_argument("--gasf_size", type=int, default=256)
     parser.add_argument("--crop_size", type=int, default=224)
     parser.add_argument("--save_dir", type=str, default="model")
@@ -762,10 +900,6 @@ def build_parser():
     parser.add_argument("--time_shift_max_ratio", type=float, default=0.01)
     parser.add_argument("--time_shift_probability", type=float, default=0.30)
 
-    amp_group = parser.add_mutually_exclusive_group()
-    amp_group.add_argument("--amp", dest="amp", action="store_true")
-    amp_group.add_argument("--no-amp", dest="amp", action="store_false")
-    parser.set_defaults(amp=True)
     return parser
 
 
@@ -781,16 +915,16 @@ def print_args(args):
 def validate_args(args):
     if args.crop_size > args.gasf_size:
         raise ValueError("crop_size must not exceed gasf_size")
-    if not 1 <= args.multi_class <= args.class_num:
+    if not 1 <= args.TD_class_num <= args.SD_class_num:
         raise ValueError(
-            "multi_class must be within [1, class_num], "
-            f"got multi_class={args.multi_class}, class_num={args.class_num}"
+            "TD_class_num must be within [1, SD_class_num], "
+            f"got TD_class_num={args.TD_class_num}, SD_class_num={args.SD_class_num}"
         )
-    pretrain_model_path = args.pretrain_model_path.expanduser().resolve()
-    if not pretrain_model_path.is_file():
-        raise FileNotFoundError(
-            f"Pretrained checkpoint not found: {pretrain_model_path}"
-        )
+    # pretrain_model_path = args.pretrain_model_path.expanduser().resolve()
+    # if not pretrain_model_path.is_file():
+    #     raise FileNotFoundError(
+    #         f"Pretrained checkpoint not found: {pretrain_model_path}"
+    #     )
 
 
 def main():

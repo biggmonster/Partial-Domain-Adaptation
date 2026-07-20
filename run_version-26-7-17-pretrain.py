@@ -127,27 +127,28 @@ def make_loaders(args, augment_config):
         ↓
     创建PyTorch DataLoader    
     '''
-    source_records, mat_shape = build_source_records(
+    SD_records, mat_shape = build_source_records(
         args.raw_mat_path,
         args.class_num,
         args.samples_per_class,
         args.source_samples_per_class,
     )
     train_records, validation_records = split_train_valid(
-        source_records, args.source_val_ratio, args.seed
+        SD_records, args.source_val_ratio, args.seed
     )
     transform = image_transform(args.gasf_size, args.crop_size)
-    train_dataset = data_list.MatSourceGASFDataset(
-        train_records,
+
+    SD_dataset = data_list.MatSourceGASFDataset(
+        SD_records,
         mat_path=args.raw_mat_path,
         transform=transform,
         gasf_size=args.gasf_size,
         seed=args.seed,
         samples_per_class=args.samples_per_class,
         augment_config=augment_config,
-        contrastive=True,
+        contrastive=True,         # 在预阶段数据增强
+        snr_db=args.s,
     )
- 
 
     common_loader_args = {
         "num_workers": args.worker,
@@ -157,8 +158,8 @@ def make_loaders(args, augment_config):
     if args.worker > 0:
         common_loader_args["prefetch_factor"] = args.prefetch_factor
 
-    train_loader = DataLoader(
-        train_dataset,
+    SD_loader = DataLoader(
+        SD_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
@@ -168,9 +169,9 @@ def make_loaders(args, augment_config):
     print(
         f"MAT X shape: {mat_shape}; source uses the first "
         f"{args.source_samples_per_class}/{args.samples_per_class} samples per class; "
-        f"train={len(train_dataset)}, validation={0}"
+        f"train={len(SD_dataset)}, validation={0}"
     )
-    return train_loader
+    return SD_loader
 
 
 def build_models(args, device):
@@ -287,32 +288,32 @@ def evaluate_source(
     print("\nSource validation accuracy by class:")
     print("-" * 55)
 
-    for class_index in range(class_num):
-        category_correct = class_correct_cpu[
-            class_index
-        ].item()
-        category_total = class_total_cpu[
-            class_index
-        ].item()
+    # for class_index in range(class_num):
+    #     category_correct = class_correct_cpu[
+    #         class_index
+    #     ].item()
+    #     category_total = class_total_cpu[
+    #         class_index
+    #     ].item()
 
-        if category_total > 0:
-            category_accuracy = (
-                category_correct / category_total
-            )
+    #     if category_total > 0:
+    #         category_accuracy = (
+    #             category_correct / category_total
+    #         )
 
-            print(
-                f"C{class_index + 1:02d} "
-                f"(label={class_index:02d}): "
-                f"{category_accuracy * 100:6.2f}% "
-                f"({category_correct:2d}/"
-                f"{category_total:2d})"
-            )
-        else:
-            print(
-                f"C{class_index + 1:02d} "
-                f"(label={class_index:02d}): "
-                "N/A (0 samples)"
-            )
+    #         print(
+    #             f"C{class_index + 1:02d} "
+    #             f"(label={class_index:02d}): "
+    #             f"{category_accuracy * 100:6.2f}% "
+    #             f"({category_correct:2d}/"
+    #             f"{category_total:2d})"
+    #         )
+    #     else:
+    #         print(
+    #             f"C{class_index + 1:02d} "
+    #             f"(label={class_index:02d}): "
+    #             "N/A (0 samples)"
+    #         )
 
     print("-" * 55)
     print(
@@ -353,7 +354,7 @@ def train(args):
     device = torch.device("cuda")
     amp_enabled = bool(args.amp)
     augment_config = make_augment_config(args)
-    train_loader = make_loaders(args, augment_config)
+    SD_loader = make_loaders(args, augment_config)
     base_network, classifier = build_models(args, device)
 
     parameter_list = (
@@ -379,7 +380,7 @@ def train(args):
     checkpoint_path = (
         Path(args.save_dir)
         / args.net
-        / f"SD_{args.class_num}class_SNR_20_pretrain_{timestamp}.pt"
+        / f"SD_{args.class_num}class_SNR_{args.s}_pretrain_{timestamp}.pt"
     )
     best_accuracy = -1.0
     epochs_without_improvement = 0
@@ -392,7 +393,7 @@ def train(args):
         contrast_total = 0.0
         batches = 0
         progress = tqdm(
-            train_loader,
+            SD_loader,
             desc=f"Epoch {epoch:03d}/{args.max_epoch:03d}",
             dynamic_ncols=True,
             unit="batch",
@@ -428,7 +429,6 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
 
-
             ce_total += ce_loss.detach().item()
             contrast_total += contrast_loss.detach().item()
             batches += 1
@@ -438,41 +438,43 @@ def train(args):
                 label_con=f"{contrast_total / batches:.4f}",
             )
 
-        validation_accuracy = evaluate_source(
-            train_loader,
-            base_network,
-            classifier,
-            device,
-            amp_enabled,
-            args.class_num
-        )
-        print(
-            f"Epoch {epoch:03d}: CE={ce_total / max(1, batches):.6f}, "
-            f"Label-CON={contrast_total / max(1, batches):.6f}, "
-            f"source_val_acc={validation_accuracy:.6f}"
-        )
-
-        if validation_accuracy > best_accuracy:
-            best_accuracy = validation_accuracy
-            epochs_without_improvement = 0
-            save_checkpoint(
-                checkpoint_path,
-                args,
-                augment_config,
-                epoch,
-                validation_accuracy,
+        test_interval_epoch = int(args.max_epoch / 20)
+        if epoch % test_interval_epoch == 0 or epoch == args.max_epoch:
+            validation_accuracy = evaluate_source(
+                SD_loader,
                 base_network,
                 classifier,
+                device,
+                amp_enabled,
+                args.class_num
             )
-            print(f"Saved best source-only pretraining checkpoint: {checkpoint_path}")
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= args.early_stop:
-                print(
-                    f"Early stopping after {args.early_stop} epochs without "
-                    "source-validation improvement."
+            print(
+                f"Epoch {epoch:03d}: CE={ce_total / max(1, batches):.6f}, "
+                f"Label-CON={contrast_total / max(1, batches):.6f}, "
+                f"source_val_acc={validation_accuracy:.6f}"
+            )
+
+            if validation_accuracy > best_accuracy:
+                best_accuracy = validation_accuracy
+                epochs_without_improvement = 0
+                save_checkpoint(
+                    checkpoint_path,
+                    args,
+                    augment_config,
+                    epoch,
+                    validation_accuracy,
+                    base_network,
+                    classifier,
                 )
-                break
+                print(f"Saved best source-only pretraining checkpoint: {checkpoint_path}")
+            else:
+                epochs_without_improvement += test_interval_epoch
+                if epochs_without_improvement >= args.early_stop:
+                    print(
+                        f"Early stopping after {args.early_stop} epochs without "
+                        "source-validation improvement."
+                    )
+                    break
 
     print(f"Best source validation accuracy: {best_accuracy:.6f}")
     print(f"Pretraining checkpoint: {checkpoint_path}")
@@ -485,7 +487,12 @@ def build_parser():
     )
     # Keep the former command line accepted so existing launch scripts do not
     # fail. Target-domain compatibility options are intentionally ignored.
-    parser.add_argument("--s", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--s",
+        type=float,
+        default=20.0,
+        help="Source-domain signal-to-noise ratio in dB",
+    )
     parser.add_argument("--t", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--output", type=str, default="run", help=argparse.SUPPRESS)
     parser.add_argument("--dset", type=str, default="LongSig_50", help=argparse.SUPPRESS)
