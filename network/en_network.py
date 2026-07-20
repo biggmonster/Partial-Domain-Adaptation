@@ -46,7 +46,7 @@ resnet_dict = {
 }
 
 class ResNetFc(nn.Module):
-  def __init__(self, resnet_name, use_bottleneck=True, bottleneck_dim=512, new_cls=False,  embedding_dim=256):
+  def __init__(self, resnet_name, use_bottleneck=True, bottleneck_dim=512, embedding_dim=256):
     super(ResNetFc, self).__init__()
     model_resnet = resnet_dict[resnet_name](weights=resnet_weights_dict[resnet_name])   # 预训练模型参数  
 
@@ -83,13 +83,11 @@ class ResNetFc(nn.Module):
        
     # self.embedding_dim = embedding_dim
     self.use_bottleneck = use_bottleneck
-    self.new_cls = new_cls
-    if new_cls:        # 论文使用分类器True
-        if self.use_bottleneck:     # 论文使用瓶颈层：将特征维度压缩到bottleneck_dim
-            self.bottleneck = nn.Linear(model_resnet.fc.in_features, bottleneck_dim)    # model_resnet.fc.in_features表示平均池化avgpool后的特征：2048
+    if self.use_bottleneck:     # 论文使用瓶颈层：将特征维度压缩到bottleneck_dim
+        self.bottleneck = nn.Linear(model_resnet.fc.in_features, bottleneck_dim)    # model_resnet.fc.in_features表示平均池化avgpool后的特征：2048
 
-            self.bottleneck.apply(init_weights)              # 对新的网络层进行初始化，其余层使用预训练的参数
-            self.__in_features = bottleneck_dim
+        self.bottleneck.apply(init_weights)              # 对新的网络层进行初始化，其余层使用预训练的参数
+        self.__in_features = bottleneck_dim
   
   '''
   ResNet50_feature_layers   --> 瓶颈层 bottleneck + fc
@@ -98,7 +96,7 @@ class ResNetFc(nn.Module):
   def forward(self, x):
     x = self.feature_layers(x)       
     x = x.view(x.size(0), -1)    
-    if self.use_bottleneck and self.new_cls: 
+    if self.use_bottleneck: 
         x = self.bottleneck(x)
         e = self.encoder(x)   # 编码输出，维度（ batch_size, embedding_dim ）  e- encoder
         r = self.decoder(e)   # 解码输出，维度（ batch_size, bottleneck_dim ） r- decoder
@@ -182,7 +180,7 @@ def load_model_repvgg_B1g2_weights():
     return model_repvgg
 
 class RepVGG_B1g2(nn.Module):
-    def __init__(self, use_bottleneck=True, bottleneck_dim=512, new_cls=False, embedding_dim=256, use_checkpoint=False, pretrain_path=None):
+    def __init__(self, use_bottleneck=True, bottleneck_dim=512, embedding_dim=256, use_checkpoint=False, pretrain_path=None):
         super (RepVGG_B1g2, self).__init__()
         if pretrain_path:
             model_repvgg = torch.load(pretrain_path)
@@ -207,7 +205,6 @@ class RepVGG_B1g2(nn.Module):
             nn.ReLU())
         
         self.use_bottleneck = use_bottleneck
-        self.new_cls = new_cls 
 
         self.bottleneck = nn.Linear(model_repvgg.linear.in_features, bottleneck_dim)    # model_resnet.fc.in_features表示平均池化avgpool后的特征：2048
 
@@ -225,7 +222,7 @@ class RepVGG_B1g2(nn.Module):
         out = self.gap(out)
         out = out.view(out.size(0), -1)
 
-        if self.use_bottleneck and self.new_cls: 
+        if self.use_bottleneck: 
             x = self.bottleneck(out)
             e = self.encoder(x)   
             r = self.decoder(e)  
@@ -559,3 +556,16 @@ class StochasticClassifier(nn.Module):
         表示生成一个[30,512] 性质的随机张量, 其中的每一个元素都来自标准正态分布N(0,1)
 
     '''
+
+
+class common_fc(nn.Module):
+    def __init__(self, in_features, num_classes):
+        super(common_fc, self).__init__()
+        self.fc = nn.Linear(in_features, num_classes)
+        self.apply(init_weights)
+
+    def forward(self, x):
+        return self.fc(x)
+
+    def get_parameters(self):
+        return [{"params": self.parameters(), "lr_mult":10, 'decay_mult':2}]
