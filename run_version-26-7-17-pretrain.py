@@ -25,7 +25,39 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def image_transform(resize_size=256, crop_size=224):
+def image_train_transform(args, resize_size=256, crop_size=224):
+    """Deterministic image conversion; augmentation is performed on I/Q only.
+    模型输入
+    """
+    if args.RandomCrop =="Yes":
+        if args.RandomHorizontalFlip =="Yes":
+            print("RandomCrop =Yes, RandomHorizontalFlip=Yes")
+            return transforms.Compose([
+                    transforms.Resize((resize_size, resize_size)),
+                    transforms.RandomCrop(crop_size),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ])
+        else:
+            print("RandomCrop =Yes, RandomHorizontalFlip=No")
+            return transforms.Compose([
+                    transforms.Resize((resize_size, resize_size)),
+                    transforms.RandomCrop(crop_size),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ])
+    else:
+        print("RandomCrop =No, RandomHorizontalFlip=No")
+        return transforms.Compose([
+                    transforms.Resize((resize_size, resize_size)),
+                    transforms.CenterCrop(crop_size),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ])
+
+
+def image_test_transform(resize_size=256, crop_size=224):
     """Deterministic image conversion; augmentation is performed on I/Q only.
     GASF RGB图片
         ↓ 调整尺寸
@@ -136,17 +168,28 @@ def make_loaders(args, augment_config):
     train_records, validation_records = split_train_valid(
         SD_records, args.source_val_ratio, args.seed
     )
-    transform = image_transform(args.gasf_size, args.crop_size)
 
     SD_dataset = data_list.MatSourceGASFDataset(
         SD_records,
         mat_path=args.raw_mat_path,
-        transform=transform,
+        transform=image_train_transform(args),
         gasf_size=args.gasf_size,
         seed=args.seed,
         samples_per_class=args.samples_per_class,
         augment_config=augment_config,
         contrastive=True,         # 在预阶段数据增强
+        snr_db=args.s,
+    )
+
+    test_dataset = data_list.MatSourceGASFDataset(
+        SD_records,
+        mat_path=args.raw_mat_path,
+        transform=image_test_transform(),
+        gasf_size=args.gasf_size,
+        seed=args.seed,
+        samples_per_class=args.samples_per_class,
+        augment_config=augment_config,
+        contrastive=False,         # 在预阶段数据增强
         snr_db=args.s,
     )
 
@@ -165,13 +208,20 @@ def make_loaders(args, augment_config):
         drop_last=True,
         **common_loader_args,
     )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        **common_loader_args,
+    )
 
     print(
         f"MAT X shape: {mat_shape}; source uses the first "
         f"{args.source_samples_per_class}/{args.samples_per_class} samples per class; "
         f"train={len(SD_dataset)}, validation={0}"
     )
-    return SD_loader
+    return SD_loader, test_loader
 
 
 def build_models(args, device):
@@ -180,7 +230,6 @@ def build_models(args, device):
             "resnet_name": args.net,
             "use_bottleneck": True,
             "bottleneck_dim": args.fdim,
-            "new_cls": True,
             "embedding_dim": args.edim,
         }
         base_network = en_network.ResNetFc(**parameters)
@@ -188,16 +237,22 @@ def build_models(args, device):
         parameters = {
             "use_bottleneck": True,
             "bottleneck_dim": args.fdim,
-            "new_cls": True,
             "embedding_dim": args.edim,
         }
         base_network = en_network.RepVGG_B1g2(**parameters)
     else:
         raise ValueError(f"Unsupported network: {args.net}")
 
-    classifier = en_network.StochasticClassifier(
-        base_network.output_num(), args.class_num
-    )
+    if args.classifier_type == "FC_classifier":
+        classifier = en_network.common_fc(
+            base_network.output_num(), args.class_num
+        )
+    elif args.classifier_type == "stochastic_classifier":
+        classifier = en_network.StochasticClassifier(
+            base_network.output_num(), args.class_num
+        )
+    else:
+        raise ValueError(f"Unsupported classifier type: {args.classifier_type}")
 
     return (
         base_network.to(device),
@@ -220,6 +275,7 @@ def evaluate_source(
     device,
     amp_enabled,
     class_num,
+    args
 ):
     base_network.eval()
     classifier.eval()
@@ -242,7 +298,7 @@ def evaluate_source(
     )
 
     with torch.no_grad():
-        for images, _, labels, _ in loader:
+        for images, labels, _ in loader:
             images = images.to(
                 device,
                 non_blocking=True,
@@ -256,10 +312,15 @@ def evaluate_source(
                 enabled=amp_enabled
             ):
                 features, _, _ = base_network(images)
-                logits = classifier(
-                    features,
-                    mode="test",
-                )
+                if args.classifier_type == "stochastic_classifier":
+                    logits = classifier(
+                        features,
+                        mode="test",
+                    )
+                elif args.classifier_type == "FC_classifier":
+                    logits = classifier(
+                        features
+                    )
 
             predictions = logits.argmax(dim=1)
             matches = predictions.eq(labels)
@@ -282,38 +343,8 @@ def evaluate_source(
 
     accuracy = correct / total if total else 0.0
 
-    class_correct_cpu = class_correct.cpu()
-    class_total_cpu = class_total.cpu()
-
     print("\nSource validation accuracy by class:")
     print("-" * 55)
-
-    # for class_index in range(class_num):
-    #     category_correct = class_correct_cpu[
-    #         class_index
-    #     ].item()
-    #     category_total = class_total_cpu[
-    #         class_index
-    #     ].item()
-
-    #     if category_total > 0:
-    #         category_accuracy = (
-    #             category_correct / category_total
-    #         )
-
-    #         print(
-    #             f"C{class_index + 1:02d} "
-    #             f"(label={class_index:02d}): "
-    #             f"{category_accuracy * 100:6.2f}% "
-    #             f"({category_correct:2d}/"
-    #             f"{category_total:2d})"
-    #         )
-    #     else:
-    #         print(
-    #             f"C{class_index + 1:02d} "
-    #             f"(label={class_index:02d}): "
-    #             "N/A (0 samples)"
-    #         )
 
     print("-" * 55)
     print(
@@ -335,6 +366,7 @@ def save_checkpoint(
 ):
     checkpoint = {
         "base_network": copy.deepcopy(base_network.state_dict()),
+        "classifier_type": args.classifier_type,
         "classifier": copy.deepcopy(classifier.state_dict()),
         "source_val_acc": validation_accuracy,
         "epoch": epoch,
@@ -354,7 +386,7 @@ def train(args):
     device = torch.device("cuda")
     amp_enabled = bool(args.amp)
     augment_config = make_augment_config(args)
-    SD_loader = make_loaders(args, augment_config)
+    SD_loader, test_loader = make_loaders(args, augment_config)
     base_network, classifier = build_models(args, device)
 
     parameter_list = (
@@ -380,7 +412,7 @@ def train(args):
     checkpoint_path = (
         Path(args.save_dir)
         / args.net
-        / f"SD_{args.class_num}class_SNR_{args.s}_pretrain_{timestamp}.pt"
+        / f"SD_SNR_{int(args.s)}_class_{args.class_num}_pretrain_{args.classifier_type}_{timestamp}.pt"
     )
     best_accuracy = -1.0
     epochs_without_improvement = 0
@@ -425,7 +457,6 @@ def train(args):
                 total_loss = ce_loss + weighted_contrast_loss
 
             scaler.scale(total_loss).backward()
-            # scaler.scale(ce_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
@@ -441,12 +472,13 @@ def train(args):
         test_interval_epoch = int(args.max_epoch / 20)
         if epoch % test_interval_epoch == 0 or epoch == args.max_epoch:
             validation_accuracy = evaluate_source(
-                SD_loader,
+                test_loader,
                 base_network,
                 classifier,
                 device,
                 amp_enabled,
-                args.class_num
+                args.class_num,
+                args
             )
             print(
                 f"Epoch {epoch:03d}: CE={ce_total / max(1, batches):.6f}, "
@@ -502,11 +534,14 @@ def build_parser():
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--max_epoch", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=36)
     parser.add_argument("--worker", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--net", type=str, default="RepVGG_B1g2")
     parser.add_argument("--class_num", type=int, default=50)
+    parser.add_argument("--classifier_type", type=str, default=None, 
+                        help=["stochastic_classifier", "FC_classifier"]
+                        )
     parser.add_argument("--classifiers_num", type=int, default=3)
     parser.add_argument("--early_stop", type=int, default=15)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -530,6 +565,14 @@ def build_parser():
     )
     parser.add_argument("--gasf_size", type=int, default=256)
     parser.add_argument("--crop_size", type=int, default=224)
+    parser.add_argument("--RandomHorizontalFlip", type=str, 
+                        default="Yes",
+                        help=["Yes","No"]
+                        )
+    parser.add_argument("--RandomCrop", type=str, 
+                        default="Yes",
+                        help=["Yes","No"]
+                        )
     parser.add_argument("--save_dir", type=str, default="model")
     parser.add_argument("--snr_min", type=float, default=20.0)
     parser.add_argument("--snr_max", type=float, default=30.0)
@@ -561,7 +604,6 @@ def print_args(args):
 def validate_args(args):
     if args.crop_size > args.gasf_size:
         raise ValueError("crop_size must not exceed gasf_size")
-
 
 
 def main():
